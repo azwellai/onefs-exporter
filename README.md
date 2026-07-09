@@ -132,4 +132,4 @@ scrape_configs:
 
 ## 라이선스
 
-TBD
+MIT License — [LICENSE](LICENSE) 참고
