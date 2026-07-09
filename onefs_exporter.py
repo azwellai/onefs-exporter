@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import ssl
+import sys
 import threading
 import time
 import urllib.error
@@ -146,6 +147,59 @@ def onefs_get(path, params=None):
     req = urllib.request.Request(url, headers={"Authorization": AUTH_HEADER})
     with urllib.request.urlopen(req, timeout=TIMEOUT, context=SSL_CTX) as resp:
         return json.loads(resp.read())
+
+
+def validate_config():
+    errors = []
+    if not ENDPOINT:
+        errors.append("ONEFS_ENDPOINT is required")
+    if not USERNAME:
+        errors.append("ONEFS_USERNAME is required")
+    if not PASSWORD:
+        errors.append("ONEFS_PASSWORD is required")
+    if POLL_INTERVAL <= 0:
+        errors.append("POLL_INTERVAL_SECONDS must be a positive integer")
+    if TIMEOUT <= 0:
+        errors.append("ONEFS_API_TIMEOUT must be a positive integer")
+    if not (1 <= LISTEN_PORT <= 65535):
+        errors.append("LISTEN_PORT must be between 1 and 65535")
+    if ALL_STATS_ENABLED:
+        if ALL_POLL_INTERVAL <= 0:
+            errors.append("ALL_POLL_INTERVAL_SECONDS must be a positive integer")
+        if ALL_BATCH_SIZE <= 0:
+            errors.append("ALL_BATCH_SIZE must be a positive integer")
+
+    if errors:
+        print("[onefs-exporter] invalid configuration:", file=sys.stderr, flush=True)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+
+def preflight_check():
+    print(f"[onefs-exporter] checking connectivity to {ENDPOINT} as '{USERNAME}' ...", flush=True)
+    try:
+        onefs_get("/platform/1/cluster/config")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            print(
+                f"[onefs-exporter] FATAL: authentication failed (HTTP {e.code}) for "
+                f"user '{USERNAME}' at {ENDPOINT} — check ONEFS_USERNAME/ONEFS_PASSWORD",
+                file=sys.stderr, flush=True,
+            )
+        else:
+            print(
+                f"[onefs-exporter] FATAL: OneFS API at {ENDPOINT} returned HTTP {e.code}: {e}",
+                file=sys.stderr, flush=True,
+            )
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(
+            f"[onefs-exporter] FATAL: cannot reach OneFS API at {ENDPOINT}: {e}",
+            file=sys.stderr, flush=True,
+        )
+        sys.exit(1)
+    print("[onefs-exporter] connectivity OK", flush=True)
 
 
 def fetch_stats(keys, nodes_all=False):
@@ -409,6 +463,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    validate_config()
+    preflight_check()
     threading.Thread(target=poll_loop, daemon=True).start()
     threading.Thread(target=poll_loop_all, daemon=True).start()
     print(f"[onefs-exporter] listening on :{LISTEN_PORT}, polling {ENDPOINT} "
