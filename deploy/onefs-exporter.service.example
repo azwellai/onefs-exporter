@@ -1,0 +1,20 @@
+[Unit]
+Description=Custom OneFS (PowerScale) Prometheus Exporter
+After=network-online.target containerd.service
+Wants=network-online.target
+Requires=containerd.service
+
+[Service]
+# nerdctl example — swap ExecStart for `docker run ...` if using Docker
+Environment=PATH=/opt/nerdctl-full/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=-/opt/nerdctl-full/bin/nerdctl rm -f onefs-exporter
+ExecStart=/opt/nerdctl-full/bin/nerdctl run --rm --name onefs-exporter \
+  --env-file /etc/onefs-exporter/env \
+  -p 9684:9684 \
+  onefs-exporter:latest
+ExecStop=/opt/nerdctl-full/bin/nerdctl stop onefs-exporter
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
