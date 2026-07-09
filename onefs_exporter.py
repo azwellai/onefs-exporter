@@ -312,9 +312,72 @@ def poll_loop_all():
         time.sleep(max(ALL_POLL_INTERVAL - (time.time() - start), 5))
 
 
+def _fmt_ts(ts):
+    if not ts:
+        return "never"
+    age = time.time() - ts
+    return f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))} ({int(age)}s ago)"
+
+
+def render_index_html():
+    with _lock:
+        last_success = _last_success
+        err = _last_error
+    with _all_lock:
+        all_err = _all_last_error
+        all_dur = _all_last_duration
+
+    status = "OK" if not err else "ERROR"
+    status_color = "#2e7d32" if not err else "#c62828"
+    all_status = "disabled" if not ALL_STATS_ENABLED else ("OK" if not all_err else "ERROR")
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>onefs-exporter</title>
+<style>
+  body {{ font-family: -apple-system, Helvetica, Arial, sans-serif; max-width: 720px; margin: 40px auto; color: #222; line-height: 1.5; }}
+  h1 {{ font-size: 1.4em; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 1em 0; }}
+  td, th {{ text-align: left; padding: 6px 10px; border-bottom: 1px solid #ddd; font-size: 0.92em; }}
+  th {{ color: #666; width: 40%; }}
+  a.metrics-link {{ display: inline-block; margin-top: 0.5em; padding: 8px 16px; background: #2e7d32; color: white; text-decoration: none; border-radius: 4px; }}
+  code {{ background: #f2f2f2; padding: 1px 5px; border-radius: 3px; }}
+  .status {{ font-weight: bold; }}
+  footer {{ margin-top: 2em; font-size: 0.8em; color: #888; }}
+</style>
+</head>
+<body>
+  <h1>onefs-exporter</h1>
+  <p>Prometheus exporter for Dell PowerScale (OneFS) — <code>{ENDPOINT}</code></p>
+  <table>
+    <tr><th>Curated metrics</th><td class="status" style="color:{status_color}">{status}</td></tr>
+    <tr><th>Last successful poll</th><td>{_fmt_ts(last_success)}</td></tr>
+    <tr><th>Poll interval</th><td>{POLL_INTERVAL}s</td></tr>
+    <tr><th>Full-catalog metrics</th><td>{all_status}</td></tr>
+    <tr><th>Last full-catalog sweep</th><td>{all_dur:.1f}s duration</td></tr>
+    <tr><th>Full-catalog poll interval</th><td>{ALL_POLL_INTERVAL}s</td></tr>
+  </table>
+  <a class="metrics-link" href="/metrics">View /metrics</a>
+  <footer>
+    <a href="https://github.com/azwellai/onefs-exporter">azwellai/onefs-exporter</a>
+  </footer>
+</body>
+</html>
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.startswith("/metrics"):
+        if self.path in ("/", "/index.html"):
+            data = render_index_html().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path.startswith("/metrics"):
             with _lock:
                 body = _cache_text
                 err = _last_error
