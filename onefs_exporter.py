@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import json
+import logging
 import os
 import ssl
 import sys
@@ -21,6 +22,13 @@ ALL_BATCH_SIZE = int(os.environ.get("ALL_BATCH_SIZE", "200"))
 ALL_STATS_ENABLED = os.environ.get("ALL_STATS_ENABLED", "true").lower() == "true"
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "9684"))
 TIMEOUT = int(os.environ.get("ONEFS_API_TIMEOUT", "10"))
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s [onefs-exporter] %(message)s",
+)
+logger = logging.getLogger("onefs-exporter")
 
 NUMERIC_TYPES = {"uint64", "int32", "double", "int64"}
 
@@ -93,11 +101,10 @@ def collect_all():
     global _all_catalog_cluster_keys, _all_catalog_node_keys
     if not _all_catalog_cluster_keys and not _all_catalog_node_keys:
         _all_catalog_cluster_keys, _all_catalog_node_keys = fetch_catalog()
-        print(
-            f"[onefs-exporter] full catalog loaded: "
-            f"{len(_all_catalog_cluster_keys)} cluster keys, "
-            f"{len(_all_catalog_node_keys)} node keys (numeric only)",
-            flush=True,
+        logger.info(
+            "full catalog loaded: %d cluster keys, %d node keys (numeric only)",
+            len(_all_catalog_cluster_keys),
+            len(_all_catalog_node_keys),
         )
 
     lines = []
@@ -118,7 +125,7 @@ def collect_all():
         try:
             stats = fetch_stats(batch)
         except Exception as e:
-            print(f"[onefs-exporter] cluster batch failed: {e}", flush=True)
+            logger.warning("cluster batch failed: %s", e)
             continue
         for key, entries in stats.items():
             for s in entries:
@@ -130,7 +137,7 @@ def collect_all():
         try:
             stats = fetch_stats(batch, nodes_all=True)
         except Exception as e:
-            print(f"[onefs-exporter] node batch failed: {e}", flush=True)
+            logger.warning("node batch failed: %s", e)
             continue
         for key, entries in stats.items():
             for s in entries:
@@ -168,38 +175,38 @@ def validate_config():
             errors.append("ALL_POLL_INTERVAL_SECONDS must be a positive integer")
         if ALL_BATCH_SIZE <= 0:
             errors.append("ALL_BATCH_SIZE must be a positive integer")
+    if LOG_LEVEL.upper() not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        errors.append(
+            "LOG_LEVEL must be one of DEBUG/INFO/WARNING/ERROR/CRITICAL"
+        )
 
     if errors:
-        print("[onefs-exporter] invalid configuration:", file=sys.stderr, flush=True)
+        logger.critical("invalid configuration:")
         for e in errors:
-            print(f"  - {e}", file=sys.stderr, flush=True)
+            logger.critical("  - %s", e)
         sys.exit(1)
 
 
 def preflight_check():
-    print(f"[onefs-exporter] checking connectivity to {ENDPOINT} as '{USERNAME}' ...", flush=True)
+    logger.info("checking connectivity to %s as '%s' ...", ENDPOINT, USERNAME)
     try:
         onefs_get("/platform/1/cluster/config")
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
-            print(
-                f"[onefs-exporter] FATAL: authentication failed (HTTP {e.code}) for "
-                f"user '{USERNAME}' at {ENDPOINT} — check ONEFS_USERNAME/ONEFS_PASSWORD",
-                file=sys.stderr, flush=True,
+            logger.critical(
+                "FATAL: authentication failed (HTTP %s) for user '%s' at %s "
+                "— check ONEFS_USERNAME/ONEFS_PASSWORD",
+                e.code, USERNAME, ENDPOINT,
             )
         else:
-            print(
-                f"[onefs-exporter] FATAL: OneFS API at {ENDPOINT} returned HTTP {e.code}: {e}",
-                file=sys.stderr, flush=True,
+            logger.critical(
+                "FATAL: OneFS API at %s returned HTTP %s: %s", ENDPOINT, e.code, e
             )
         sys.exit(1)
     except urllib.error.URLError as e:
-        print(
-            f"[onefs-exporter] FATAL: cannot reach OneFS API at {ENDPOINT}: {e}",
-            file=sys.stderr, flush=True,
-        )
+        logger.critical("FATAL: cannot reach OneFS API at %s: %s", ENDPOINT, e)
         sys.exit(1)
-    print("[onefs-exporter] connectivity OK", flush=True)
+    logger.info("connectivity OK")
 
 
 def fetch_stats(keys, nodes_all=False):
@@ -340,7 +347,7 @@ def poll_loop():
         except Exception as e:
             with _lock:
                 _last_error = str(e)
-            print(f"[onefs-exporter] scrape failed: {e}", flush=True)
+            logger.warning("scrape failed: %s", e)
         time.sleep(POLL_INTERVAL)
 
 
@@ -357,12 +364,14 @@ def poll_loop_all():
                 _all_cache_text = text
                 _all_last_error = ""
                 _all_last_duration = dur
-            print(f"[onefs-exporter] full-catalog sweep done in {dur:.1f}s, "
-                  f"{text.count(chr(10))} lines", flush=True)
+            logger.info(
+                "full-catalog sweep done in %.1fs, %d lines",
+                dur, text.count(chr(10)),
+            )
         except Exception as e:
             with _all_lock:
                 _all_last_error = str(e)
-            print(f"[onefs-exporter] full-catalog sweep failed: {e}", flush=True)
+            logger.warning("full-catalog sweep failed: %s", e)
         time.sleep(max(ALL_POLL_INTERVAL - (time.time() - start), 5))
 
 
@@ -459,7 +468,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, fmt, *args):
-        pass
+        logger.debug(fmt, *args)
 
 
 if __name__ == "__main__":
@@ -467,6 +476,8 @@ if __name__ == "__main__":
     preflight_check()
     threading.Thread(target=poll_loop, daemon=True).start()
     threading.Thread(target=poll_loop_all, daemon=True).start()
-    print(f"[onefs-exporter] listening on :{LISTEN_PORT}, polling {ENDPOINT} "
-          f"every {POLL_INTERVAL}s (curated) / {ALL_POLL_INTERVAL}s (full catalog)", flush=True)
+    logger.info(
+        "listening on :%d, polling %s every %ds (curated) / %ds (full catalog)",
+        LISTEN_PORT, ENDPOINT, POLL_INTERVAL, ALL_POLL_INTERVAL,
+    )
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()

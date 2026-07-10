@@ -88,6 +88,7 @@ systemctl enable --now onefs-exporter.service
 | `ALL_POLL_INTERVAL_SECONDS` | `300` | Poll interval for full-catalog metrics (seconds) |
 | `ALL_BATCH_SIZE` | `200` | Number of keys per API call when fetching the full catalog |
 | `LISTEN_PORT` | `9684` | Port the exporter listens on |
+| `LOG_LEVEL` | `INFO` | Log verbosity — DEBUG/INFO/WARNING/ERROR/CRITICAL |
 
 ## Metrics
 

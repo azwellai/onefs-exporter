@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.0
+
+- Convert `print()`-based output to Python's `logging` module — messages now carry a timestamp and level (`INFO`/`WARNING`/`CRITICAL`). Fatal config/connectivity errors continue to go to stderr.
+- Add `LOG_LEVEL` config (default `INFO`) to control log verbosity; validated at startup like other config.
+
 ## 0.4.0
 
 - Add fail-fast startup validation: required config (`ONEFS_USERNAME`, `ONEFS_PASSWORD`, `ONEFS_ENDPOINT`, port/interval ranges) is checked before the process starts serving.
