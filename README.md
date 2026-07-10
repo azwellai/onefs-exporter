@@ -14,9 +14,9 @@ Dell's official [csm-metrics-powerscale](https://github.com/dell/csm-metrics-pow
 
 ```
 ┌─────────────────┐      REST/HTTPS       ┌──────────────────┐      /metrics       ┌────────────┐
-│  PowerScale      │ <──────────────────── │  onefs-exporter  │ <────────────────── │ Prometheus │
-│  (OneFS PAPI)    │   basic auth          │  (single binary) │   text exposition   │            │
-└─────────────────┘                        └──────────────────┘                     └────────────┘
+│  PowerScale     │ <──────────────────── │  onefs-exporter  │ <────────────────── │ Prometheus │
+│  (OneFS PAPI)   │      basic auth       │  (single binary) │   text exposition   │            │
+└─────────────────┘                       └──────────────────┘                     └────────────┘
 ```
 
 - **Curated metrics**: the commonly-needed core metrics (capacity/performance, per-node CPU & memory, protocol, network, job engine, health) polled every 30s
