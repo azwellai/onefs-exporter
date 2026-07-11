@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.0
+
+- Container now runs as a dedicated non-root user (uid 65532 `exporter`) instead of root.
+
 ## 0.6.1
 
 - Add stdlib unittest suite covering metric-name sanitization, batching, stats parsing, catalog filtering, curated/full-catalog collection, config validation, and the landing page.

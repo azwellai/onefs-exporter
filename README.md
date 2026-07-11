@@ -132,6 +132,7 @@ scrape_configs:
 
 ## Notes
 
+- The container runs as a dedicated non-root user (uid 65532 `exporter`) by default. The exporter writes nothing to disk and binds an unprivileged port (9684), so no extra privileges are required.
 - Authentication is HTTP Basic Auth, sent on every request.
 - If the PowerScale cluster is a shared resource, don't set the full-catalog poll interval (`ALL_POLL_INTERVAL_SECONDS`) too aggressively.
 - You can query the full OneFS statistics key catalog yourself via `GET /platform/3/statistics/keys`.
