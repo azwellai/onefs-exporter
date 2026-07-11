@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.0
+
+- Fix full-catalog metrics losing the `node` label for node `devid=0`: the label was gated on a truthy check, so device 0's samples dropped their `node="0"` label and collided with cluster-scope samples. Now every node-scope sample is labelled.
+- Add `ONEFS_PASSWORD_FILE`: read the OneFS password from a file (e.g. a Docker/Kubernetes secret), taking precedence over `ONEFS_PASSWORD`. Only a trailing newline is stripped. Keeps the password out of the process environment and `docker inspect`.
+- Add GitHub Actions CI running `py_compile` and the unittest suite on Python 3.9 and 3.12.
+
 ## 0.7.0
 
 - Container now runs as a dedicated non-root user (uid 65532 `exporter`) instead of root.
