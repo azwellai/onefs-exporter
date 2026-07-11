@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.0
+
+- Refactor the module-level mutable collector state (curated and full-catalog caches, poll timestamps, errors, and the discovered statistics catalog) plus their locks into two encapsulated classes, `CuratedCollector` and `FullCatalogCollector`, instantiated as module singletons. The exporter remains a single file. No behavior change: identical metric output, endpoints, and log messages.
+- Add comprehensive documentation throughout: a module-level docstring describing the two-collector architecture and data flow, class/method docstrings covering the threading model, and section comments for navigation.
+
 ## 0.8.0
 
 - Fix full-catalog metrics losing the `node` label for node `devid=0`: the label was gated on a truthy check, so device 0's samples dropped their `node="0"` label and collided with cluster-scope samples. Now every node-scope sample is labelled.

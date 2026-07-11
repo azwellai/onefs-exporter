@@ -1,4 +1,41 @@
 #!/usr/bin/env python3
+"""Prometheus exporter for Dell PowerScale (OneFS) clusters.
+
+This is a single-file, stdlib-only exporter. It exposes OneFS statistics in the
+Prometheus text format on an HTTP endpoint.
+
+Two-collector architecture
+---------------------------
+The exporter runs two independent background collectors, each on its own thread
+and its own polling interval:
+
+  * ``CuratedCollector`` (default every 30s) — a hand-picked set of cluster- and
+    node-level metrics with stable, human-friendly names (``onefs_cluster_*``,
+    ``onefs_node_*``, ``onefs_protocol_*``, plus scrape-health metrics). This is
+    the low-cardinality, always-on set most deployments graph and alert on.
+
+  * ``FullCatalogCollector`` (default every 5min, opt-out via ``ALL_STATS_ENABLED``)
+    — every numeric key advertised by ``/platform/3/statistics/keys``, emitted
+    as raw ``onefs_raw_*`` gauges. This is high-cardinality and polled far less
+    often; the statistics catalog is discovered once and cached.
+
+Data flow
+---------
+Each collector's background thread polls OneFS, renders a block of Prometheus
+text, and stores it in the collector under a lock. The HTTP handler never talks
+to OneFS itself: on each request it reads the most recently cached text via each
+collector's thread-safe ``snapshot()`` and concatenates it. This decouples scrape
+latency from OneFS API latency and lets many concurrent scrapes share one poll.
+
+Endpoints
+---------
+  * ``/`` (and ``/index.html``) — HTML status landing page.
+  * ``/metrics`` — Prometheus exposition (curated block, then full-catalog block,
+    then sweep-duration/error metadata).
+  * ``/healthz`` — liveness; always ``200 ok`` while the process serves.
+  * ``/readyz`` — readiness; ``200`` once a curated poll has succeeded and the
+    data is fresh within ``max(3 x POLL_INTERVAL, 90s)``, else ``503``.
+"""
 import base64
 import json
 import logging
@@ -11,6 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 
 def _resolve_password(env_password, env_password_file):
     """Resolve the OneFS password, preferring a file over the env var.
@@ -34,6 +72,8 @@ def _resolve_password(env_password, env_password_file):
     return env_password, ""
 
 
+# --- configuration -----------------------------------------------------------
+# All tunables come from the environment so the container needs no config file.
 ENDPOINT = os.environ.get("ONEFS_ENDPOINT", "onefs.example.com:8080")
 USERNAME = os.environ.get("ONEFS_USERNAME", "")
 PASSWORD_FILE = os.environ.get("ONEFS_PASSWORD_FILE", "")
@@ -55,13 +95,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("onefs-exporter")
 
+# OneFS statistics-catalog types we treat as numeric (everything else is skipped
+# by the full-catalog collector, since Prometheus samples must be numbers).
 NUMERIC_TYPES = {"uint64", "int32", "double", "int64"}
 
+# Precomputed once: the Basic auth header and the TLS context. INSECURE skips
+# certificate verification, which is common for OneFS clusters using self-signed
+# certs on the management interface.
 AUTH_HEADER = "Basic " + base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
 SSL_CTX = ssl._create_unverified_context() if INSECURE else ssl.create_default_context()
 
 PROTOCOLS = ["nfs", "nfs4", "smb2", "http"]
 
+# The curated cluster- and node-scope keys requested from OneFS on every poll.
 STAT_KEYS_CLUSTER = [
     "ifs.bytes.total",
     "ifs.bytes.avail",
@@ -87,93 +133,13 @@ STAT_KEYS_NODE = [
     "node.net.int.bytes.out.rate",
 ]
 
-_lock = threading.Lock()
-_cache_text = "# no data collected yet\n"
-_last_success = 0
-_last_error = ""
 
-_all_lock = threading.Lock()
-_all_cache_text = "# no full-catalog data collected yet\n"
-_all_last_error = ""
-_all_last_duration = 0.0
-_all_catalog_cluster_keys = []
-_all_catalog_node_keys = []
-
-
-def sanitize_metric_name(key):
-    return "onefs_raw_" + "".join(c if (c.isalnum() or c == "_") else "_" for c in key)
-
-
-def fetch_catalog():
-    data = onefs_get("/platform/3/statistics/keys")
-    cluster_keys, node_keys = [], []
-    for k in data.get("keys", []):
-        if k.get("type") not in NUMERIC_TYPES:
-            continue
-        if k.get("scope") == "cluster":
-            cluster_keys.append(k["key"])
-        elif k.get("scope") == "node":
-            node_keys.append(k["key"])
-    return cluster_keys, node_keys
-
-
-def chunked(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
-
-
-def collect_all():
-    global _all_catalog_cluster_keys, _all_catalog_node_keys
-    if not _all_catalog_cluster_keys and not _all_catalog_node_keys:
-        _all_catalog_cluster_keys, _all_catalog_node_keys = fetch_catalog()
-        logger.info(
-            "full catalog loaded: %d cluster keys, %d node keys (numeric only)",
-            len(_all_catalog_cluster_keys),
-            len(_all_catalog_node_keys),
-        )
-
-    lines = []
-    emitted_help = set()
-
-    def emit(key, devid, value):
-        name = sanitize_metric_name(key)
-        if name not in emitted_help:
-            lines.append(f"# HELP {name} raw OneFS statistics key {key}")
-            lines.append(f"# TYPE {name} gauge")
-            emitted_help.add(name)
-        if devid is not None:
-            lines.append(f'{name}{{node="{devid}"}} {value}')
-        else:
-            lines.append(f"{name} {value}")
-
-    for batch in chunked(_all_catalog_cluster_keys, ALL_BATCH_SIZE):
-        try:
-            stats = fetch_stats(batch)
-        except Exception as e:
-            logger.warning("cluster batch failed: %s", e)
-            continue
-        for key, entries in stats.items():
-            for s in entries:
-                v = s.get("value")
-                if isinstance(v, (int, float)):
-                    emit(key, None, v)
-
-    for batch in chunked(_all_catalog_node_keys, ALL_BATCH_SIZE):
-        try:
-            stats = fetch_stats(batch, nodes_all=True)
-        except Exception as e:
-            logger.warning("node batch failed: %s", e)
-            continue
-        for key, entries in stats.items():
-            for s in entries:
-                v = s.get("value")
-                if isinstance(v, (int, float)):
-                    emit(key, s.get("devid"), v)
-
-    return "\n".join(lines) + "\n"
-
+# --- OneFS API helpers --------------------------------------------------------
+# Stateless functions that talk to the OneFS platform API or transform its data.
+# They hold no mutable state and are safe to call from any thread.
 
 def onefs_get(path, params=None):
+    """GET a OneFS platform-API path and return the parsed JSON body."""
     query = ("?" + urllib.parse.urlencode(params)) if params else ""
     url = f"https://{ENDPOINT}{path}{query}"
     req = urllib.request.Request(url, headers={"Authorization": AUTH_HEADER})
@@ -181,62 +147,11 @@ def onefs_get(path, params=None):
         return json.loads(resp.read())
 
 
-def validate_config():
-    errors = []
-    if not ENDPOINT:
-        errors.append("ONEFS_ENDPOINT is required")
-    if not USERNAME:
-        errors.append("ONEFS_USERNAME is required")
-    if _password_file_error:
-        errors.append(_password_file_error)
-    elif not PASSWORD:
-        errors.append("ONEFS_PASSWORD or ONEFS_PASSWORD_FILE is required")
-    if POLL_INTERVAL <= 0:
-        errors.append("POLL_INTERVAL_SECONDS must be a positive integer")
-    if TIMEOUT <= 0:
-        errors.append("ONEFS_API_TIMEOUT must be a positive integer")
-    if not (1 <= LISTEN_PORT <= 65535):
-        errors.append("LISTEN_PORT must be between 1 and 65535")
-    if ALL_STATS_ENABLED:
-        if ALL_POLL_INTERVAL <= 0:
-            errors.append("ALL_POLL_INTERVAL_SECONDS must be a positive integer")
-        if ALL_BATCH_SIZE <= 0:
-            errors.append("ALL_BATCH_SIZE must be a positive integer")
-    if LOG_LEVEL.upper() not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
-        errors.append(
-            "LOG_LEVEL must be one of DEBUG/INFO/WARNING/ERROR/CRITICAL"
-        )
-
-    if errors:
-        logger.critical("invalid configuration:")
-        for e in errors:
-            logger.critical("  - %s", e)
-        sys.exit(1)
-
-
-def preflight_check():
-    logger.info("checking connectivity to %s as '%s' ...", ENDPOINT, USERNAME)
-    try:
-        onefs_get("/platform/1/cluster/config")
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            logger.critical(
-                "FATAL: authentication failed (HTTP %s) for user '%s' at %s "
-                "— check ONEFS_USERNAME/ONEFS_PASSWORD",
-                e.code, USERNAME, ENDPOINT,
-            )
-        else:
-            logger.critical(
-                "FATAL: OneFS API at %s returned HTTP %s: %s", ENDPOINT, e.code, e
-            )
-        sys.exit(1)
-    except urllib.error.URLError as e:
-        logger.critical("FATAL: cannot reach OneFS API at %s: %s", ENDPOINT, e)
-        sys.exit(1)
-    logger.info("connectivity OK")
-
-
 def fetch_stats(keys, nodes_all=False):
+    """Fetch current values for stat keys, grouped by key (errored stats dropped).
+
+    With ``nodes_all=True`` OneFS returns one entry per node for node-scope keys.
+    """
     params = {"keys": ",".join(keys)}
     if nodes_all:
         params["nodes"] = "all"
@@ -249,160 +164,302 @@ def fetch_stats(keys, nodes_all=False):
     return by_key
 
 
+def fetch_catalog():
+    """Discover all numeric statistics keys, split into (cluster, node) scope."""
+    data = onefs_get("/platform/3/statistics/keys")
+    cluster_keys, node_keys = [], []
+    for k in data.get("keys", []):
+        if k.get("type") not in NUMERIC_TYPES:
+            continue
+        if k.get("scope") == "cluster":
+            cluster_keys.append(k["key"])
+        elif k.get("scope") == "node":
+            node_keys.append(k["key"])
+    return cluster_keys, node_keys
+
+
 def fetch_running_jobs():
+    """Return the list of currently running job-engine jobs."""
     data = onefs_get("/platform/1/job/jobs", {"state": "running"})
     return data.get("jobs", [])
 
 
+def sanitize_metric_name(key):
+    """Turn a raw OneFS key into a valid Prometheus metric name (``onefs_raw_*``)."""
+    return "onefs_raw_" + "".join(c if (c.isalnum() or c == "_") else "_" for c in key)
+
+
+def chunked(seq, size):
+    """Yield successive ``size``-length slices of ``seq``."""
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
 def esc(label_value):
+    """Escape a Prometheus label value (backslash and double-quote)."""
     return str(label_value).replace("\\", "\\\\").replace('"', '\\"')
 
 
-def collect():
-    lines = []
+# --- collectors ---------------------------------------------------------------
+# Each collector owns its cached exposition text plus poll metadata behind a
+# lock. The threading contract is the same for both: exactly one writer thread
+# (the ``run_forever`` poll loop) mutates the cached state, while any number of
+# HTTP handler threads read a consistent copy through ``snapshot()``. The lock
+# exists only to keep those reads/writes atomic against each other.
 
-    def gauge(name, help_text):
-        lines.append(f"# HELP {name} {help_text}")
-        lines.append(f"# TYPE {name} gauge")
+class CuratedCollector:
+    """Curated, low-cardinality OneFS metrics polled on the short interval.
 
-    # cluster-wide stats
-    cluster_stats = fetch_stats(STAT_KEYS_CLUSTER)
+    Owns the cached curated exposition text, the Unix time of the last
+    successful poll, and the last error string. ``run_forever`` is the single
+    writer; ``snapshot`` serves readers.
+    """
 
-    def cluster_val(key):
-        s = cluster_stats.get(key)
-        return s[0]["value"] if s else None
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cache_text = "# no data collected yet\n"
+        self.last_success = 0
+        self.last_error = ""
 
-    gauge("onefs_cluster_capacity_total_bytes", "Total cluster capacity in bytes")
-    v = cluster_val("ifs.bytes.total")
-    if v is not None:
-        lines.append(f"onefs_cluster_capacity_total_bytes {v}")
+    def collect(self):
+        """Render the curated metric set as Prometheus text (no state mutation)."""
+        lines = []
 
-    gauge("onefs_cluster_capacity_avail_bytes", "Available cluster capacity in bytes")
-    v = cluster_val("ifs.bytes.avail")
-    if v is not None:
-        lines.append(f"onefs_cluster_capacity_avail_bytes {v}")
+        def gauge(name, help_text):
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} gauge")
 
-    gauge("onefs_cluster_health", "Cluster health: 0=Healthy 1=Attention 2=Down")
-    v = cluster_val("cluster.health")
-    if v is not None:
-        lines.append(f"onefs_cluster_health {v}")
+        # cluster-wide stats
+        cluster_stats = fetch_stats(STAT_KEYS_CLUSTER)
 
-    gauge("onefs_cluster_alert_count", "Number of active critical-and-above alerts")
-    v = cluster_val("cluster.alert.info")
-    if v is not None:
-        lines.append(f"onefs_cluster_alert_count {len(v)}")
+        def cluster_val(key):
+            s = cluster_stats.get(key)
+            return s[0]["value"] if s else None
 
-    gauge("onefs_cluster_cpu_sys_percent", "Cluster average system CPU percent (x10)")
-    v = cluster_val("cluster.cpu.sys.avg")
-    if v is not None:
-        lines.append(f"onefs_cluster_cpu_sys_percent {v / 10.0}")
-
-    for metric, key in [
-        ("onefs_cluster_disk_xfers_in_rate", "cluster.disk.xfers.in.rate"),
-        ("onefs_cluster_disk_xfers_out_rate", "cluster.disk.xfers.out.rate"),
-        ("onefs_cluster_disk_bytes_in_rate", "cluster.disk.bytes.in.rate"),
-        ("onefs_cluster_disk_bytes_out_rate", "cluster.disk.bytes.out.rate"),
-    ]:
-        gauge(metric, f"OneFS stat key {key}")
-        v = cluster_val(key)
+        gauge("onefs_cluster_capacity_total_bytes", "Total cluster capacity in bytes")
+        v = cluster_val("ifs.bytes.total")
         if v is not None:
-            lines.append(f"{metric} {v}")
+            lines.append(f"onefs_cluster_capacity_total_bytes {v}")
 
-    gauge("onefs_protocol_op_rate", "Protocol operation rate (ops/sec)")
-    gauge("onefs_protocol_in_rate_bytes", "Protocol inbound byte rate")
-    gauge("onefs_protocol_out_rate_bytes", "Protocol outbound byte rate")
-    for proto in PROTOCOLS:
-        s = cluster_stats.get(f"cluster.protostats.{proto}.total")
-        if not s or not s[0]["value"]:
-            continue
-        entry = s[0]["value"][0]
-        lbl = f'protocol="{esc(proto)}"'
-        lines.append(f"onefs_protocol_op_rate{{{lbl}}} {entry.get('op_rate', 0)}")
-        lines.append(f"onefs_protocol_in_rate_bytes{{{lbl}}} {entry.get('in_rate', 0)}")
-        lines.append(f"onefs_protocol_out_rate_bytes{{{lbl}}} {entry.get('out_rate', 0)}")
+        gauge("onefs_cluster_capacity_avail_bytes", "Available cluster capacity in bytes")
+        v = cluster_val("ifs.bytes.avail")
+        if v is not None:
+            lines.append(f"onefs_cluster_capacity_avail_bytes {v}")
 
-    # per-node stats
-    node_stats = fetch_stats(STAT_KEYS_NODE, nodes_all=True)
+        gauge("onefs_cluster_health", "Cluster health: 0=Healthy 1=Attention 2=Down")
+        v = cluster_val("cluster.health")
+        if v is not None:
+            lines.append(f"onefs_cluster_health {v}")
 
-    def node_values(key):
-        return {str(s["devid"]): s["value"] for s in node_stats.get(key, [])}
+        gauge("onefs_cluster_alert_count", "Number of active critical-and-above alerts")
+        v = cluster_val("cluster.alert.info")
+        if v is not None:
+            lines.append(f"onefs_cluster_alert_count {len(v)}")
 
-    gauge("onefs_node_health", "Node health: 0=Healthy 1=Attention 2=Down")
-    for node, v in node_values("node.health").items():
-        lines.append(f'onefs_node_health{{node="{node}"}} {v}')
+        gauge("onefs_cluster_cpu_sys_percent", "Cluster average system CPU percent (x10)")
+        v = cluster_val("cluster.cpu.sys.avg")
+        if v is not None:
+            lines.append(f"onefs_cluster_cpu_sys_percent {v / 10.0}")
 
-    for metric, key, scale in [
-        ("onefs_node_cpu_idle_percent", "node.cpu.idle.avg", 0.1),
-        ("onefs_node_cpu_sys_percent", "node.cpu.sys.avg", 0.1),
-        ("onefs_node_cpu_user_percent", "node.cpu.user.avg", 0.1),
-        ("onefs_node_memory_used_bytes", "node.memory.used", 1),
-        ("onefs_node_memory_free_bytes", "node.memory.free", 1),
-        ("onefs_node_net_ext_bytes_in_rate", "node.net.ext.bytes.in.rate", 1),
-        ("onefs_node_net_ext_bytes_out_rate", "node.net.ext.bytes.out.rate", 1),
-        ("onefs_node_net_int_bytes_in_rate", "node.net.int.bytes.in.rate", 1),
-        ("onefs_node_net_int_bytes_out_rate", "node.net.int.bytes.out.rate", 1),
-    ]:
-        gauge(metric, f"OneFS stat key {key}")
-        for node, v in node_values(key).items():
-            lines.append(f'{metric}{{node="{node}"}} {v * scale}')
+        for metric, key in [
+            ("onefs_cluster_disk_xfers_in_rate", "cluster.disk.xfers.in.rate"),
+            ("onefs_cluster_disk_xfers_out_rate", "cluster.disk.xfers.out.rate"),
+            ("onefs_cluster_disk_bytes_in_rate", "cluster.disk.bytes.in.rate"),
+            ("onefs_cluster_disk_bytes_out_rate", "cluster.disk.bytes.out.rate"),
+        ]:
+            gauge(metric, f"OneFS stat key {key}")
+            v = cluster_val(key)
+            if v is not None:
+                lines.append(f"{metric} {v}")
 
-    # job engine
-    gauge("onefs_job_engine_running_jobs", "Number of currently running job engine jobs")
-    try:
-        jobs = fetch_running_jobs()
-        lines.append(f"onefs_job_engine_running_jobs {len(jobs)}")
-    except Exception:
-        pass
+        gauge("onefs_protocol_op_rate", "Protocol operation rate (ops/sec)")
+        gauge("onefs_protocol_in_rate_bytes", "Protocol inbound byte rate")
+        gauge("onefs_protocol_out_rate_bytes", "Protocol outbound byte rate")
+        for proto in PROTOCOLS:
+            s = cluster_stats.get(f"cluster.protostats.{proto}.total")
+            if not s or not s[0]["value"]:
+                continue
+            entry = s[0]["value"][0]
+            lbl = f'protocol="{esc(proto)}"'
+            lines.append(f"onefs_protocol_op_rate{{{lbl}}} {entry.get('op_rate', 0)}")
+            lines.append(f"onefs_protocol_in_rate_bytes{{{lbl}}} {entry.get('in_rate', 0)}")
+            lines.append(f"onefs_protocol_out_rate_bytes{{{lbl}}} {entry.get('out_rate', 0)}")
 
-    gauge("onefs_exporter_scrape_success", "1 if the last scrape of OneFS succeeded")
-    lines.append("onefs_exporter_scrape_success 1")
-    gauge("onefs_exporter_last_success_timestamp_seconds", "Unix time of last successful scrape")
-    lines.append(f"onefs_exporter_last_success_timestamp_seconds {int(time.time())}")
+        # per-node stats
+        node_stats = fetch_stats(STAT_KEYS_NODE, nodes_all=True)
 
-    return "\n".join(lines) + "\n"
+        def node_values(key):
+            return {str(s["devid"]): s["value"] for s in node_stats.get(key, [])}
 
+        gauge("onefs_node_health", "Node health: 0=Healthy 1=Attention 2=Down")
+        for node, v in node_values("node.health").items():
+            lines.append(f'onefs_node_health{{node="{node}"}} {v}')
 
-def poll_loop():
-    global _cache_text, _last_success, _last_error
-    while True:
+        for metric, key, scale in [
+            ("onefs_node_cpu_idle_percent", "node.cpu.idle.avg", 0.1),
+            ("onefs_node_cpu_sys_percent", "node.cpu.sys.avg", 0.1),
+            ("onefs_node_cpu_user_percent", "node.cpu.user.avg", 0.1),
+            ("onefs_node_memory_used_bytes", "node.memory.used", 1),
+            ("onefs_node_memory_free_bytes", "node.memory.free", 1),
+            ("onefs_node_net_ext_bytes_in_rate", "node.net.ext.bytes.in.rate", 1),
+            ("onefs_node_net_ext_bytes_out_rate", "node.net.ext.bytes.out.rate", 1),
+            ("onefs_node_net_int_bytes_in_rate", "node.net.int.bytes.in.rate", 1),
+            ("onefs_node_net_int_bytes_out_rate", "node.net.int.bytes.out.rate", 1),
+        ]:
+            gauge(metric, f"OneFS stat key {key}")
+            for node, v in node_values(key).items():
+                lines.append(f'{metric}{{node="{node}"}} {v * scale}')
+
+        # job engine
+        gauge("onefs_job_engine_running_jobs", "Number of currently running job engine jobs")
         try:
-            text = collect()
-            with _lock:
-                _cache_text = text
-                _last_success = time.time()
-                _last_error = ""
-        except Exception as e:
-            with _lock:
-                _last_error = str(e)
-            logger.warning("scrape failed: %s", e)
-        time.sleep(POLL_INTERVAL)
+            jobs = fetch_running_jobs()
+            lines.append(f"onefs_job_engine_running_jobs {len(jobs)}")
+        except Exception:
+            pass
+
+        gauge("onefs_exporter_scrape_success", "1 if the last scrape of OneFS succeeded")
+        lines.append("onefs_exporter_scrape_success 1")
+        gauge("onefs_exporter_last_success_timestamp_seconds", "Unix time of last successful scrape")
+        lines.append(f"onefs_exporter_last_success_timestamp_seconds {int(time.time())}")
+
+        return "\n".join(lines) + "\n"
+
+    def run_forever(self):
+        """Poll loop (one writer thread): collect, then cache under the lock."""
+        while True:
+            try:
+                text = self.collect()
+                with self.lock:
+                    self.cache_text = text
+                    self.last_success = time.time()
+                    self.last_error = ""
+            except Exception as e:
+                with self.lock:
+                    self.last_error = str(e)
+                logger.warning("scrape failed: %s", e)
+            time.sleep(POLL_INTERVAL)
+
+    def snapshot(self):
+        """Return ``(cache_text, last_success, last_error)`` atomically for readers."""
+        with self.lock:
+            return self.cache_text, self.last_success, self.last_error
 
 
-def poll_loop_all():
-    global _all_cache_text, _all_last_error, _all_last_duration
-    if not ALL_STATS_ENABLED:
-        return
-    while True:
-        start = time.time()
-        try:
-            text = collect_all()
-            dur = time.time() - start
-            with _all_lock:
-                _all_cache_text = text
-                _all_last_error = ""
-                _all_last_duration = dur
+class FullCatalogCollector:
+    """High-cardinality raw OneFS metrics polled on the long interval.
+
+    Owns the cached full-catalog exposition text, the last error, the last sweep
+    duration, and the discovered statistics catalog (cluster/node key lists). The
+    catalog is fetched once on the first sweep and reused thereafter. ``collect_all``
+    runs only on the single ``run_forever`` writer thread; ``snapshot`` serves readers.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cache_text = "# no full-catalog data collected yet\n"
+        self.last_error = ""
+        self.last_duration = 0.0
+        self.catalog_cluster_keys = []
+        self.catalog_node_keys = []
+
+    def collect_all(self):
+        """Render every numeric catalog key as ``onefs_raw_*`` text.
+
+        Discovers and caches the catalog on first call. Runs on the writer thread
+        only; it mutates the cached catalog key lists.
+        """
+        if not self.catalog_cluster_keys and not self.catalog_node_keys:
+            self.catalog_cluster_keys, self.catalog_node_keys = fetch_catalog()
             logger.info(
-                "full-catalog sweep done in %.1fs, %d lines",
-                dur, text.count(chr(10)),
+                "full catalog loaded: %d cluster keys, %d node keys (numeric only)",
+                len(self.catalog_cluster_keys),
+                len(self.catalog_node_keys),
             )
-        except Exception as e:
-            with _all_lock:
-                _all_last_error = str(e)
-            logger.warning("full-catalog sweep failed: %s", e)
-        time.sleep(max(ALL_POLL_INTERVAL - (time.time() - start), 5))
 
+        lines = []
+        emitted_help = set()
+
+        def emit(key, devid, value):
+            name = sanitize_metric_name(key)
+            if name not in emitted_help:
+                lines.append(f"# HELP {name} raw OneFS statistics key {key}")
+                lines.append(f"# TYPE {name} gauge")
+                emitted_help.add(name)
+            if devid is not None:
+                lines.append(f'{name}{{node="{devid}"}} {value}')
+            else:
+                lines.append(f"{name} {value}")
+
+        for batch in chunked(self.catalog_cluster_keys, ALL_BATCH_SIZE):
+            try:
+                stats = fetch_stats(batch)
+            except Exception as e:
+                logger.warning("cluster batch failed: %s", e)
+                continue
+            for key, entries in stats.items():
+                for s in entries:
+                    v = s.get("value")
+                    if isinstance(v, (int, float)):
+                        emit(key, None, v)
+
+        for batch in chunked(self.catalog_node_keys, ALL_BATCH_SIZE):
+            try:
+                stats = fetch_stats(batch, nodes_all=True)
+            except Exception as e:
+                logger.warning("node batch failed: %s", e)
+                continue
+            for key, entries in stats.items():
+                for s in entries:
+                    v = s.get("value")
+                    if isinstance(v, (int, float)):
+                        emit(key, s.get("devid"), v)
+
+        return "\n".join(lines) + "\n"
+
+    def run_forever(self):
+        """Poll loop (one writer thread): no-op if disabled, else sweep and cache.
+
+        The interval is self-correcting: it subtracts the sweep duration so sweeps
+        start roughly every ``ALL_POLL_INTERVAL`` seconds (with a 5s floor).
+        """
+        if not ALL_STATS_ENABLED:
+            return
+        while True:
+            start = time.time()
+            try:
+                text = self.collect_all()
+                dur = time.time() - start
+                with self.lock:
+                    self.cache_text = text
+                    self.last_error = ""
+                    self.last_duration = dur
+                logger.info(
+                    "full-catalog sweep done in %.1fs, %d lines",
+                    dur, text.count(chr(10)),
+                )
+            except Exception as e:
+                with self.lock:
+                    self.last_error = str(e)
+                logger.warning("full-catalog sweep failed: %s", e)
+            time.sleep(max(ALL_POLL_INTERVAL - (time.time() - start), 5))
+
+    def snapshot(self):
+        """Return ``(cache_text, last_error, last_duration)`` atomically for readers."""
+        with self.lock:
+            return self.cache_text, self.last_error, self.last_duration
+
+
+# Module-level singletons: the background threads write these, the HTTP handler
+# reads them. Tests construct their own instances for isolation.
+curated = CuratedCollector()
+full_catalog = FullCatalogCollector()
+
+
+# --- HTTP server --------------------------------------------------------------
 
 def _fmt_ts(ts):
+    """Format a Unix timestamp as 'local time (Ns ago)', or 'never' if unset."""
     if not ts:
         return "never"
     age = time.time() - ts
@@ -410,12 +467,9 @@ def _fmt_ts(ts):
 
 
 def render_index_html():
-    with _lock:
-        last_success = _last_success
-        err = _last_error
-    with _all_lock:
-        all_err = _all_last_error
-        all_dur = _all_last_duration
+    """Render the HTML status landing page from the collectors' snapshots."""
+    _, last_success, err = curated.snapshot()
+    _, all_err, all_dur = full_catalog.snapshot()
 
     status = "OK" if not err else "ERROR"
     status_color = "#2e7d32" if not err else "#c62828"
@@ -463,6 +517,13 @@ def render_index_html():
 
 
 class Handler(BaseHTTPRequestHandler):
+    """HTTP request handler serving cached metrics and health endpoints.
+
+    Handlers run on many threads (ThreadingHTTPServer) and only ever read from
+    the collectors via their thread-safe ``snapshot()`` accessors; they never
+    poll OneFS directly.
+    """
+
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             data = render_index_html().encode()
@@ -472,15 +533,14 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif self.path.startswith("/metrics"):
-            with _lock:
-                body = _cache_text
-                err = _last_error
+            # Assembly order matters for output equivalence: curated text, then a
+            # scrape-failure marker if the last curated poll errored, then the
+            # full-catalog text, then the sweep-duration metric and any error note.
+            body, _, err = curated.snapshot()
             if err:
                 body += f'\nonefs_exporter_scrape_success 0\n# last_error: {err}\n'
-            with _all_lock:
-                body += "\n" + _all_cache_text
-                all_err = _all_last_error
-                all_dur = _all_last_duration
+            all_text, all_err, all_dur = full_catalog.snapshot()
+            body += "\n" + all_text
             body += (
                 "# HELP onefs_exporter_all_stats_sweep_duration_seconds Duration of last full-catalog sweep\n"
                 "# TYPE onefs_exporter_all_stats_sweep_duration_seconds gauge\n"
@@ -502,9 +562,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif self.path.startswith("/readyz"):
-            with _lock:
-                last_success = _last_success
-                err = _last_error
+            # Ready iff a curated poll has succeeded and its data is still fresh.
+            _, last_success, err = curated.snapshot()
             now = time.time()
             stale_threshold = max(3 * POLL_INTERVAL, 90)
             age = int(now - last_success) if last_success > 0 else None
@@ -530,11 +589,70 @@ class Handler(BaseHTTPRequestHandler):
         logger.debug(fmt, *args)
 
 
+# --- startup ------------------------------------------------------------------
+
+def validate_config():
+    """Fail fast at startup if any required/ranged config value is invalid."""
+    errors = []
+    if not ENDPOINT:
+        errors.append("ONEFS_ENDPOINT is required")
+    if not USERNAME:
+        errors.append("ONEFS_USERNAME is required")
+    if _password_file_error:
+        errors.append(_password_file_error)
+    elif not PASSWORD:
+        errors.append("ONEFS_PASSWORD or ONEFS_PASSWORD_FILE is required")
+    if POLL_INTERVAL <= 0:
+        errors.append("POLL_INTERVAL_SECONDS must be a positive integer")
+    if TIMEOUT <= 0:
+        errors.append("ONEFS_API_TIMEOUT must be a positive integer")
+    if not (1 <= LISTEN_PORT <= 65535):
+        errors.append("LISTEN_PORT must be between 1 and 65535")
+    if ALL_STATS_ENABLED:
+        if ALL_POLL_INTERVAL <= 0:
+            errors.append("ALL_POLL_INTERVAL_SECONDS must be a positive integer")
+        if ALL_BATCH_SIZE <= 0:
+            errors.append("ALL_BATCH_SIZE must be a positive integer")
+    if LOG_LEVEL.upper() not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        errors.append(
+            "LOG_LEVEL must be one of DEBUG/INFO/WARNING/ERROR/CRITICAL"
+        )
+
+    if errors:
+        logger.critical("invalid configuration:")
+        for e in errors:
+            logger.critical("  - %s", e)
+        sys.exit(1)
+
+
+def preflight_check():
+    """Verify OneFS connectivity/auth at startup; exit(1) on failure."""
+    logger.info("checking connectivity to %s as '%s' ...", ENDPOINT, USERNAME)
+    try:
+        onefs_get("/platform/1/cluster/config")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            logger.critical(
+                "FATAL: authentication failed (HTTP %s) for user '%s' at %s "
+                "— check ONEFS_USERNAME/ONEFS_PASSWORD",
+                e.code, USERNAME, ENDPOINT,
+            )
+        else:
+            logger.critical(
+                "FATAL: OneFS API at %s returned HTTP %s: %s", ENDPOINT, e.code, e
+            )
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        logger.critical("FATAL: cannot reach OneFS API at %s: %s", ENDPOINT, e)
+        sys.exit(1)
+    logger.info("connectivity OK")
+
+
 if __name__ == "__main__":
     validate_config()
     preflight_check()
-    threading.Thread(target=poll_loop, daemon=True).start()
-    threading.Thread(target=poll_loop_all, daemon=True).start()
+    threading.Thread(target=curated.run_forever, daemon=True).start()
+    threading.Thread(target=full_catalog.run_forever, daemon=True).start()
     logger.info(
         "listening on :%d, polling %s every %ds (curated) / %ds (full catalog)",
         LISTEN_PORT, ENDPOINT, POLL_INTERVAL, ALL_POLL_INTERVAL,

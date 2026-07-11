@@ -1,6 +1,7 @@
 # onefs_exporter의 순수/파싱 로직을 검증하는 stdlib unittest 스위트
 import os
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -123,6 +124,7 @@ def _collect_fetch_stats(keys, nodes_all=False):
 
 class CollectTest(unittest.TestCase):
     def setUp(self):
+        self.collector = ox.CuratedCollector()
         self.p_stats = mock.patch.object(
             ox, "fetch_stats", side_effect=_collect_fetch_stats
         )
@@ -137,7 +139,7 @@ class CollectTest(unittest.TestCase):
         self.p_jobs.stop()
 
     def test_cluster_and_node_metrics(self):
-        out = ox.collect()
+        out = self.collector.collect()
         self.assertIn("onefs_cluster_capacity_total_bytes 1000", out)
         self.assertIn("onefs_cluster_health 0", out)
         # alert.info emits len() of the list
@@ -150,7 +152,7 @@ class CollectTest(unittest.TestCase):
         self.assertIn('onefs_node_health{node="2"} 1', out)
 
     def test_protocol_lines_only_for_nonempty(self):
-        out = ox.collect()
+        out = self.collector.collect()
         self.assertIn('onefs_protocol_op_rate{protocol="nfs"} 5', out)
         self.assertIn('onefs_protocol_in_rate_bytes{protocol="nfs"} 10', out)
         self.assertIn('onefs_protocol_out_rate_bytes{protocol="nfs"} 20', out)
@@ -160,21 +162,16 @@ class CollectTest(unittest.TestCase):
         self.assertNotIn('protocol="http"', out)
 
     def test_running_jobs_and_scrape_success(self):
-        out = ox.collect()
+        out = self.collector.collect()
         self.assertIn("onefs_job_engine_running_jobs 2", out)
         self.assertIn("onefs_exporter_scrape_success 1", out)
 
 
 class CollectAllTest(unittest.TestCase):
     def setUp(self):
-        self._saved_cluster = ox._all_catalog_cluster_keys
-        self._saved_node = ox._all_catalog_node_keys
-        ox._all_catalog_cluster_keys = ["cluster.k1"]
-        ox._all_catalog_node_keys = ["node.k1"]
-
-    def tearDown(self):
-        ox._all_catalog_cluster_keys = self._saved_cluster
-        ox._all_catalog_node_keys = self._saved_node
+        self.collector = ox.FullCatalogCollector()
+        self.collector.catalog_cluster_keys = ["cluster.k1"]
+        self.collector.catalog_node_keys = ["node.k1"]
 
     @staticmethod
     def _fake_onefs_get(path, params=None):
@@ -196,7 +193,7 @@ class CollectAllTest(unittest.TestCase):
 
     def test_numeric_emission_and_labels(self):
         with mock.patch.object(ox, "onefs_get", side_effect=self._fake_onefs_get):
-            out = ox.collect_all()
+            out = self.collector.collect_all()
         # cluster value (devid passed as None): no node label
         self.assertIn("onefs_raw_cluster_k1 7", out)
         self.assertNotIn('onefs_raw_cluster_k1{node=', out)
@@ -212,20 +209,31 @@ class CollectAllTest(unittest.TestCase):
 
     def test_help_type_emitted_once_per_metric(self):
         with mock.patch.object(ox, "onefs_get", side_effect=self._fake_onefs_get):
-            out = ox.collect_all()
+            out = self.collector.collect_all()
         self.assertEqual(out.count("# HELP onefs_raw_node_k1 "), 1)
         self.assertEqual(out.count("# TYPE onefs_raw_node_k1 gauge"), 1)
         self.assertEqual(out.count("# HELP onefs_raw_cluster_k1 "), 1)
 
     def test_catalog_loaded_when_empty(self):
-        ox._all_catalog_cluster_keys = []
-        ox._all_catalog_node_keys = []
+        self.collector.catalog_cluster_keys = []
+        self.collector.catalog_node_keys = []
         catalog = (["cluster.k1"], ["node.k1"])
         with mock.patch.object(ox, "fetch_catalog", return_value=catalog) as fc, \
                 mock.patch.object(ox, "onefs_get", side_effect=self._fake_onefs_get):
-            ox.collect_all()
+            self.collector.collect_all()
         fc.assert_called_once()
-        self.assertEqual(ox._all_catalog_cluster_keys, ["cluster.k1"])
+        self.assertEqual(self.collector.catalog_cluster_keys, ["cluster.k1"])
+
+    def test_instances_do_not_share_catalog_state(self):
+        # Each FullCatalogCollector owns its own catalog; mutating one (as
+        # collect_all does on first sweep) must not leak into another.
+        a = ox.FullCatalogCollector()
+        b = ox.FullCatalogCollector()
+        a.catalog_cluster_keys.append("cluster.only_a")
+        a.catalog_node_keys.append("node.only_a")
+        self.assertEqual(b.catalog_cluster_keys, [])
+        self.assertEqual(b.catalog_node_keys, [])
+        self.assertIsNot(a.catalog_cluster_keys, b.catalog_cluster_keys)
 
 
 _VALID = dict(
@@ -347,6 +355,43 @@ class RenderIndexHtmlTest(unittest.TestCase):
         self.assertIsInstance(html, str)
         self.assertIn("my.onefs.local:8080", html)
         self.assertIn('href="/metrics"', html)
+
+
+class SnapshotTest(unittest.TestCase):
+    def test_curated_snapshot_consistent_under_concurrent_writes(self):
+        c = ox.CuratedCollector()
+        stop = threading.Event()
+
+        def churn():
+            i = 0
+            while not stop.is_set():
+                with c.lock:
+                    c.cache_text = f"# text {i}\n"
+                    c.last_success = float(i)
+                    c.last_error = "" if i % 2 else "boom"
+                i += 1
+
+        writer = threading.Thread(target=churn)
+        writer.start()
+        try:
+            for _ in range(500):
+                snap = c.snapshot()
+                # snapshot() must return a 3-tuple with no exception, regardless
+                # of the concurrent writer.
+                self.assertEqual(len(snap), 3)
+                text, last_success, err = snap
+                self.assertIsInstance(text, str)
+                self.assertIsInstance(err, str)
+        finally:
+            stop.set()
+            writer.join()
+
+    def test_full_catalog_snapshot_shape(self):
+        f = ox.FullCatalogCollector()
+        text, err, dur = f.snapshot()
+        self.assertIsInstance(text, str)
+        self.assertEqual(err, "")
+        self.assertEqual(dur, 0.0)
 
 
 if __name__ == "__main__":
