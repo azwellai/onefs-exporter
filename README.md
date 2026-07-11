@@ -136,6 +136,14 @@ scrape_configs:
 - If the PowerScale cluster is a shared resource, don't set the full-catalog poll interval (`ALL_POLL_INTERVAL_SECONDS`) too aggressively.
 - You can query the full OneFS statistics key catalog yourself via `GET /platform/3/statistics/keys`.
 
+## Running tests
+
+The test suite uses only the Python standard library (`unittest`) — there are no test dependencies to install. From the repository root:
+
+```bash
+python3 -m unittest -v
+```
+
 ## License
 
 MIT License — see [LICENSE](LICENSE)

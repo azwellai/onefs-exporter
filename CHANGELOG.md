@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.1
+
+- Add stdlib unittest suite covering metric-name sanitization, batching, stats parsing, catalog filtering, curated/full-catalog collection, config validation, and the landing page.
+
 ## 0.6.0
 
 - Add `/healthz` (liveness) and `/readyz` (readiness) health check endpoints. `/healthz` always returns `200 ok` while the process serves; `/readyz` returns `200` with a small JSON body when at least one curated poll has succeeded and the data is fresh within `max(3 × POLL_INTERVAL, 90s)`, else `503`. Both are linked from the HTML landing page.
