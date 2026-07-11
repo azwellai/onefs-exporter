@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.0
+
+- Add `/healthz` (liveness) and `/readyz` (readiness) health check endpoints. `/healthz` always returns `200 ok` while the process serves; `/readyz` returns `200` with a small JSON body when at least one curated poll has succeeded and the data is fresh within `max(3 × POLL_INTERVAL, 90s)`, else `503`. Both are linked from the HTML landing page.
+
 ## 0.5.0
 
 - Convert `print()`-based output to Python's `logging` module — messages now carry a timestamp and level (`INFO`/`WARNING`/`CRITICAL`). Fatal config/connectivity errors continue to go to stderr.

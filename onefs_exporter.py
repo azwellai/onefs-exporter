@@ -423,6 +423,10 @@ def render_index_html():
     <tr><th>Full-catalog poll interval</th><td>{ALL_POLL_INTERVAL}s</td></tr>
   </table>
   <a class="metrics-link" href="/metrics">View /metrics</a>
+  <p style="margin-top:1em; font-size:0.85em; color:#666;">
+    Health checks: <a href="/healthz"><code>/healthz</code></a> (liveness) &middot;
+    <a href="/readyz"><code>/readyz</code></a> (readiness)
+  </p>
   <footer>
     <a href="https://github.com/azwellai/onefs-exporter">azwellai/onefs-exporter</a>
   </footer>
@@ -460,6 +464,34 @@ class Handler(BaseHTTPRequestHandler):
             data = body.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path.startswith("/healthz"):
+            data = b"ok\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path.startswith("/readyz"):
+            with _lock:
+                last_success = _last_success
+                err = _last_error
+            now = time.time()
+            stale_threshold = max(3 * POLL_INTERVAL, 90)
+            age = int(now - last_success) if last_success > 0 else None
+            ready = last_success > 0 and (now - last_success) <= stale_threshold
+            payload = {
+                "ready": ready,
+                "last_success_unix": int(last_success),
+                "age_seconds": age,
+                "last_error": err,
+                "stale_threshold_seconds": stale_threshold,
+            }
+            data = (json.dumps(payload) + "\n").encode()
+            self.send_response(200 if ready else 503)
+            self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)

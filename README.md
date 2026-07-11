@@ -115,6 +115,11 @@ Queries every numeric key (uint64/int32/double/int64) from OneFS's `/platform/3/
 
 > Since the payload is large (~2MB per scrape), it's recommended to inspect what you need, then set `ALL_STATS_ENABLED=false` and add the specific keys you care about to the curated list instead.
 
+## Health endpoints
+
+- `GET /healthz` (liveness) — always returns `200 ok` while the process is serving, independent of OneFS state.
+- `GET /readyz` (readiness) — returns `200` when at least one curated poll has succeeded and the data is fresh (age within `max(3 × POLL_INTERVAL_SECONDS, 90s)`), otherwise `503`. The JSON body includes `ready`, `last_success_unix`, `age_seconds`, `last_error`, and `stale_threshold_seconds`.
+
 ## Example Prometheus config
 
 ```yaml
