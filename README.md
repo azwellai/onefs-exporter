@@ -81,6 +81,7 @@ systemctl enable --now onefs-exporter.service
 | `ONEFS_ENDPOINT` | `onefs.example.com:8080` | OneFS API endpoint (`host:port`) |
 | `ONEFS_USERNAME` | (none) | OneFS account username |
 | `ONEFS_PASSWORD` | (none) | OneFS account password |
+| `ONEFS_PASSWORD_FILE` | (none) | Path to a file containing the password; if set, takes precedence over `ONEFS_PASSWORD` (only a trailing newline is stripped) |
 | `ONEFS_INSECURE` | `true` | If `true`, skip TLS certificate verification (for self-signed certs) |
 | `ONEFS_API_TIMEOUT` | `10` | API call timeout in seconds |
 | `POLL_INTERVAL_SECONDS` | `30` | Poll interval for curated metrics (seconds) |
@@ -134,6 +135,7 @@ scrape_configs:
 
 - The container runs as a dedicated non-root user (uid 65532 `exporter`) by default. The exporter writes nothing to disk and binds an unprivileged port (9684), so no extra privileges are required.
 - Authentication is HTTP Basic Auth, sent on every request.
+- Prefer `ONEFS_PASSWORD_FILE` (e.g. a Docker/Kubernetes secret mounted at `/run/secrets/onefs_password`) over `ONEFS_PASSWORD` in production: it keeps the password out of the process environment and `docker inspect` output. Only a trailing newline is stripped, so the file may contain any other characters verbatim.
 - If the PowerScale cluster is a shared resource, don't set the full-catalog poll interval (`ALL_POLL_INTERVAL_SECONDS`) too aggressively.
 - You can query the full OneFS statistics key catalog yourself via `GET /platform/3/statistics/keys`.
 

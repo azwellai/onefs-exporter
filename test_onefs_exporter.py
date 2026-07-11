@@ -1,4 +1,6 @@
 # onefs_exporter의 순수/파싱 로직을 검증하는 stdlib unittest 스위트
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -230,6 +232,7 @@ _VALID = dict(
     ENDPOINT="host:8080",
     USERNAME="user",
     PASSWORD="pw",
+    _password_file_error="",
     POLL_INTERVAL=30,
     TIMEOUT=10,
     LISTEN_PORT=9684,
@@ -238,6 +241,51 @@ _VALID = dict(
     ALL_BATCH_SIZE=200,
     LOG_LEVEL="INFO",
 )
+
+
+class ResolvePasswordTest(unittest.TestCase):
+    def _write(self, content):
+        f = tempfile.NamedTemporaryFile("w", delete=False)
+        f.write(content)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    def test_file_wins_over_env_password(self):
+        path = self._write("filepw")
+        pw, err = ox._resolve_password("envpw", path)
+        self.assertEqual(pw, "filepw")
+        self.assertEqual(err, "")
+
+    def test_trailing_newline_stripped(self):
+        path = self._write("s3cret\n")
+        pw, err = ox._resolve_password("", path)
+        self.assertEqual(pw, "s3cret")
+        self.assertEqual(err, "")
+
+    def test_preserves_non_newline_whitespace(self):
+        # leading/trailing spaces are legitimate password chars; keep them
+        path = self._write("  pass word  \n")
+        pw, err = ox._resolve_password("", path)
+        self.assertEqual(pw, "  pass word  ")
+        self.assertEqual(err, "")
+
+    def test_no_file_falls_back_to_env(self):
+        pw, err = ox._resolve_password("envpw", "")
+        self.assertEqual(pw, "envpw")
+        self.assertEqual(err, "")
+
+    def test_missing_file_returns_error(self):
+        pw, err = ox._resolve_password("envpw", "/no/such/onefs/pw/file")
+        self.assertEqual(pw, "")
+        self.assertIn("/no/such/onefs/pw/file", err)
+
+    def test_empty_file_returns_error(self):
+        path = self._write("\n")
+        pw, err = ox._resolve_password("envpw", path)
+        self.assertEqual(pw, "")
+        self.assertIn(path, err)
+        self.assertIn("empty", err)
 
 
 class ValidateConfigTest(unittest.TestCase):
@@ -269,6 +317,27 @@ class ValidateConfigTest(unittest.TestCase):
         with mock.patch.multiple(ox, **cfg):
             with self.assertRaises(SystemExit):
                 ox.validate_config()
+
+    def test_no_password_at_all_exits_with_combined_message(self):
+        cfg = dict(_VALID, PASSWORD="", _password_file_error="")
+        with mock.patch.multiple(ox, **cfg):
+            with self.assertLogs(ox.logger, level="CRITICAL") as log:
+                with self.assertRaises(SystemExit) as cm:
+                    ox.validate_config()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertTrue(
+            any("ONEFS_PASSWORD or ONEFS_PASSWORD_FILE" in m for m in log.output)
+        )
+
+    def test_password_file_unreadable_exits_with_specific_error(self):
+        _, err = ox._resolve_password("", "/no/such/onefs/pw/file")
+        cfg = dict(_VALID, PASSWORD="", _password_file_error=err)
+        with mock.patch.multiple(ox, **cfg):
+            with self.assertLogs(ox.logger, level="CRITICAL") as log:
+                with self.assertRaises(SystemExit) as cm:
+                    ox.validate_config()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertTrue(any("/no/such/onefs/pw/file" in m for m in log.output))
 
 
 class RenderIndexHtmlTest(unittest.TestCase):

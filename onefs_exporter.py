@@ -12,9 +12,34 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+def _resolve_password(env_password, env_password_file):
+    """Resolve the OneFS password, preferring a file over the env var.
+
+    If ONEFS_PASSWORD_FILE is set, the password is read from that path and only
+    a trailing newline is stripped (other whitespace may legitimately be part of
+    the password). Import must never crash on a bad file: on a read failure or an
+    empty file we return "" plus a descriptive, path-specific error string so
+    validate_config() can emit the fatal error at startup. Returns
+    (password, error) where error is "" on success.
+    """
+    if env_password_file:
+        try:
+            with open(env_password_file) as f:
+                pw = f.read().rstrip("\n")
+        except OSError as e:
+            return "", f"ONEFS_PASSWORD_FILE '{env_password_file}' could not be read: {e}"
+        if not pw:
+            return "", f"ONEFS_PASSWORD_FILE '{env_password_file}' is set but empty"
+        return pw, ""
+    return env_password, ""
+
+
 ENDPOINT = os.environ.get("ONEFS_ENDPOINT", "onefs.example.com:8080")
 USERNAME = os.environ.get("ONEFS_USERNAME", "")
-PASSWORD = os.environ.get("ONEFS_PASSWORD", "")
+PASSWORD_FILE = os.environ.get("ONEFS_PASSWORD_FILE", "")
+PASSWORD, _password_file_error = _resolve_password(
+    os.environ.get("ONEFS_PASSWORD", ""), PASSWORD_FILE
+)
 INSECURE = os.environ.get("ONEFS_INSECURE", "true").lower() == "true"
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
 ALL_POLL_INTERVAL = int(os.environ.get("ALL_POLL_INTERVAL_SECONDS", "300"))
@@ -162,8 +187,10 @@ def validate_config():
         errors.append("ONEFS_ENDPOINT is required")
     if not USERNAME:
         errors.append("ONEFS_USERNAME is required")
-    if not PASSWORD:
-        errors.append("ONEFS_PASSWORD is required")
+    if _password_file_error:
+        errors.append(_password_file_error)
+    elif not PASSWORD:
+        errors.append("ONEFS_PASSWORD or ONEFS_PASSWORD_FILE is required")
     if POLL_INTERVAL <= 0:
         errors.append("POLL_INTERVAL_SECONDS must be a positive integer")
     if TIMEOUT <= 0:
