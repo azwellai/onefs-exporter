@@ -195,10 +195,13 @@ class CollectAllTest(unittest.TestCase):
     def test_numeric_emission_and_labels(self):
         with mock.patch.object(ox, "onefs_get", side_effect=self._fake_onefs_get):
             out = ox.collect_all()
-        # cluster value: no node label
+        # cluster value (devid passed as None): no node label
         self.assertIn("onefs_raw_cluster_k1 7", out)
-        # devid=0 -> falsy -> no node label (documents `if devid:` behavior)
-        self.assertIn("onefs_raw_node_k1 11", out)
+        self.assertNotIn('onefs_raw_cluster_k1{node=', out)
+        # devid=0 -> must emit node="0" label (not collide with cluster scope)
+        self.assertIn('onefs_raw_node_k1{node="0"} 11', out)
+        # and must NOT emit an unlabelled node sample
+        self.assertNotIn("onefs_raw_node_k1 11", out)
         # devid=2 -> labelled
         self.assertIn('onefs_raw_node_k1{node="2"} 22', out)
         # non-numeric values (list / string) skipped

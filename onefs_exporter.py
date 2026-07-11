@@ -116,7 +116,7 @@ def collect_all():
             lines.append(f"# HELP {name} raw OneFS statistics key {key}")
             lines.append(f"# TYPE {name} gauge")
             emitted_help.add(name)
-        if devid:
+        if devid is not None:
             lines.append(f'{name}{{node="{devid}"}} {value}')
         else:
             lines.append(f"{name} {value}")
